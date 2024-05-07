@@ -23,9 +23,9 @@ from torchmetrics import StructuralSimilarityIndexMeasure
 from torchvision import transforms
 from torch.nn import functional as F
 import modules.scripts as scripts
-from modules.processing import Processed, process_images, fix_seed
+from modules.processing import Processed, process_images, fix_seed, create_infotext
 from modules.shared import opts, cmd_opts, state, sd_upscalers
-from modules.images import resize_image
+from modules.images import resize_image, image_grid, save_image
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from rife.RIFE_HDv3 import Model
 
@@ -104,6 +104,7 @@ class Script(scripts.Script):
         images = []
         dists = []
         gen_data = []
+        videos = []
         imgcnt=-1
         lead_inout = int(lead_inout)
         if upscale_meth != 'None' and upscale_ratio != 1.0 and upscale_ratio != 0.0:
@@ -141,62 +142,87 @@ class Script(scripts.Script):
 
         # Kludge for seed travel 
         p.subseed = p.seed
-
+ 
         # Split prompt and generate list of prompts
-        promptlist = re.split("(THEN\([^\)]*\)|THEN)", p.prompt)+[None]
-        negative_promptlist = re.split("(THEN\([^\)]*\)|THEN)", p.negative_prompt)+[None]
-
-        # Build new list
-        prompts = []
-        while len(promptlist) or len(negative_promptlist):
-            prompt, subseed, negprompt, negsubseed, new_cfg_scale = (None, None, None, None, None)
-
-            if len(negative_promptlist):
-                negprompt = negative_promptlist.pop(0).strip()
-                opts = negative_promptlist.pop(0)
-
+        #
+        # INPUT:
+        #   preamble FIRSTLY first prompt THEN second prompt THEN third prompt
+        # OUTPUT:
+        # - preamble\n first prompt
+        # - preamble\n second prompt
+        # - preamble\n third prompt
+        #
+        # INPUT:
+        # first prompt THEN second prompt THEN third prompt
+        # OUTPUT:
+        # - first prompt
+        # - second prompt
+        # - third prompt
+        def split_prompts(prompt, negative_prompt):
+            def extract_options(opts):
                 if opts:
                     opts = re.sub('THEN\((.*)\)', '\\1', opts)
                     opts = None if opts == 'THEN' else opts
                     if opts:
-                        for then_data in opts.split(','): # Get values from THEN()
+                        options = {}
+                        for then_data in opts.split(','):
                             if '=' in then_data:
                                 opt, val = then_data.split('=')
                                 if opt == 'seed':
                                     try:
-                                        negsubseed = int(val)
+                                        options['seed'] = int(val)
                                     except:
-                                        negsubseed = None
+                                        options['seed'] = None
                                 if opt == 'cfg':
                                     try:
-                                        new_cfg_scale = float(val)
+                                        options['cfg'] = float(val)
                                     except:
-                                        new_cfg_scale = None
+                                        options['cfg'] = None
+                        return options
+                return {}
 
-            if len(promptlist):
-                prompt = promptlist.pop(0).strip() # Prompt
-                opts = promptlist.pop(0) # THEN()
-                if opts:
-                    opts = re.sub('THEN\((.*)\)', '\\1', opts)
-                    opts = None if opts == 'THEN' else opts
-                    if opts:
-                        for then_data in opts.split(','): # Get values from THEN()
-                            if '=' in then_data:
-                                opt, val = then_data.split('=')
-                                if opt == 'seed':
-                                    try:
-                                        subseed = int(val)
-                                    except:
-                                        subseed = None
-                                if opt == 'cfg':
-                                    try:
-                                        new_cfg_scale = float(val)
-                                    except:
-                                        new_cfg_scale = None
+            # when FIRSTLY keyword exists
+            def extract_firstly_part(prompt):
+                if "FIRSTLY" in prompt:
+                    prompt_shared, prompt = prompt.split("FIRSTLY", 1)
+                    return [prompt_shared.strip(), prompt.strip()]
+                else:
+                    return [None, prompt]
 
-            if not subseed:
-                subseed = negsubseed
-            prompts += [(prompt, negprompt, subseed, new_cfg_scale)]
+            prompt_shared, prompt = extract_firstly_part(prompt)
+            negative_prompt_shared, negative_prompt = extract_firstly_part(negative_prompt)
+
+            promptlist = re.split("(THEN\([^\)]*\)|THEN)", prompt)+[None]
+            negative_promptlist = re.split("(THEN\([^\)]*\)|THEN)", negative_prompt)+[None]
+
+            # Build new list
+            prompts = []
+            while promptlist or negative_promptlist:
+                prompt, negprompt = (None, None)
+                options = {}
+
+                if negative_promptlist:
+                    negprompt = negative_promptlist.pop(0).strip()
+                    neg_options = extract_options(negative_promptlist.pop(0))
+                    options.update(neg_options)
+                    if negative_prompt_shared:
+                        negprompt = negative_prompt_shared + "\n" + negprompt
+
+                if promptlist:
+                    prompt = promptlist.pop(0).strip()
+                    pos_options = extract_options(promptlist.pop(0))
+                    options.update(pos_options)
+                    if prompt_shared:
+                        prompt = prompt_shared + "\n" + prompt
+
+                subseed = options.get('seed')
+                new_cfg_scale = options.get('cfg')
+
+                prompts.append((prompt, negprompt, subseed, new_cfg_scale))
+
+            return prompts
+        
+        prompts = split_prompts(p.prompt, p.negative_prompt)
 
         # Set generation helpers
         total_images = int(steps) * len(prompts)
@@ -253,7 +279,7 @@ class Script(scripts.Script):
                 proc = process_images(p)
                 imgcnt += 1
                 if initial_info is None:
-                    initial_info = proc.info
+                    initial_info = create_infotext(p, all_prompts=[initial_prompt], all_negative_prompts=[initial_negative_prompt], all_seeds=[initial_seed], all_subseeds=[initial_seed])
     
                 # upscale - copied from https://github.com/Kahsolt/stable-diffusion-webui-prompt-travel
                 if upscale_meth != 'None' and upscale_ratio != 1.0 and upscale_ratio != 0.0:
@@ -263,7 +289,7 @@ class Script(scripts.Script):
     
                 prompt_images += image
                 dists += [distance]
-                gen_data += [(imgcnt, p.prompt, p.negative_prompt, p.seed, p.subseed, p.subseed_strength, p.cfg_scale)]
+                gen_data += [(imgcnt, p.prompt, p.negative_prompt, p.seed, p.subseed, p.subseed_strength, p.cfg_scale, proc.info)]
 
             # SSIM
             if ssim_diff > 0:
@@ -315,7 +341,7 @@ class Script(scripts.Script):
                             imgcnt += 1
     
                             if initial_info is None:
-                                initial_info = proc.info
+                                initial_info = create_infotext(p, all_prompts=[initial_prompt], all_negative_prompts=[initial_negative_prompt], all_seeds=[initial_seed], all_subseeds=[initial_seed])
                             
                             # upscale - copied from https://github.com/Kahsolt/stable-diffusion-webui-prompt-travel
                             if upscale_meth != 'None' and upscale_ratio != 1.0 and upscale_ratio != 0.0:
@@ -331,7 +357,8 @@ class Script(scripts.Script):
                                 # Keep image if it is improvment or hasn't reached desired min ssim_diff
                                 prompt_images.insert(i+1, image)
                                 dists.insert(i+1, new_dist)
-                                gen_data.insert(i+1, (imgcnt, p.prompt, p.negative_prompt, p.seed, p.subseed, p.subseed_strength, p.cfg_scale))
+                                gen_data.insert(i+1, (imgcnt, p.prompt, p.negative_prompt, p.seed, p.subseed, p.subseed_strength, p.cfg_scale, proc.info))
+
                             else:
                                 print(f"Did not find improvment: {d2} < {d} ({d-d2}) Taking shortcut.")
                                 not_better += 1
@@ -365,21 +392,16 @@ class Script(scripts.Script):
             # End of prompt_image loop
             images += prompt_images
 
-        if mirror_mode:
-            images = images + images[::-1]
-
         # Save video before continuing with SSIM-stats and RIFE (If things crashes we will atleast have this video)
         if save_video:
+            video_images = images
             if mirror_mode:
-                images = images + images[::-1]
+                video_images = video_images + video_images[::-1]
             try:
-                frames = [np.asarray(images[0])] * lead_inout + [np.asarray(t) for t in images] + [np.asarray(images[-1])] * lead_inout
+                frames = [np.asarray(video_images[0])] * lead_inout + [np.asarray(t) for t in video_images] + [np.asarray(video_images[-1])] * lead_inout
                 fps = video_fps if video_fps > 0 else len(frames) / abs(video_fps)
-                filename = f"shift-{shift_number:05}.mp4"
-                writer = imageio.get_writer(os.path.join(shift_path, filename), fps=fps)
-                for frame in frames:
-                    writer.append_data(frame)
-                writer.close()
+                filename = f"shift-{shift_number:05}"
+                videos += _save(path=os.path.join(shift_path, filename), frames=frames, fps=fps, infotext=initial_info, width=p.width, height=p.height)
             except Exception as err:
                 print(f"ERROR: Failed generating video: {err}")
 
@@ -449,8 +471,8 @@ class Script(scripts.Script):
             # Generation log
             D.append('\n- Generation log ----------------------\n')
             i = 0
-            for c,pr,negp,s,ss,d,cfg in gen_data:
-                # count, promp, neg_prompt, seed, subseed, strength
+            for c,pr,negp,s,ss,d,cfg,info in gen_data:
+                # count, promp, neg_prompt, seed, subseed, strength, info
                 if s == ss:
                     D.append(f"\n--- Frame: {i:05} Image: {c:05} Seed: {s} CFG: {cfg}\n")
                 else:
@@ -541,18 +563,99 @@ class Script(scripts.Script):
             try:
                 frames = [np.asarray(rife_images[0])] * lead_inout + [np.asarray(t) for t in rife_images] + [np.asarray(rife_images[-1])] * lead_inout
                 fps = video_fps if video_fps > 0 else len(frames) / abs(video_fps)
-                filename = f"shift-rife-{shift_number:05}.mp4"
-                writer = imageio.get_writer(os.path.join(shift_path, filename), fps=fps)
-                for frame in frames:
-                    writer.append_data(frame)
-                writer.close()
+                filename = f"shift-rife-{shift_number:05}"
+                videos += _save(path=os.path.join(shift_path, filename), fps=fps, frames=frames, infotext=initial_info, width=p.width, height=p.height)
             except Exception as err:
                 print(f"ERROR: Failed generating RIFE video: {err}")
+
         # RIFE end
 
-        processed = Processed(p, images if show_images else [], p.seed, initial_info)
+        # create grid
+        grid = image_grid(images)
+
+        images = [grid] + videos + images
+        all_prompts = [initial_prompt] + [initial_prompt for v in videos]
+        all_negative_prompts = [initial_negative_prompt] + [initial_negative_prompt for v in videos]
+        all_subseeds = [-1] + [-1 for v in videos]
+        infotexts = [initial_info] + [initial_info for v in videos]
+
+        for c,pr,negp,s,ss,d,cfg,info in gen_data:
+            # count, promp, neg_prompt, seed, subseed, strength, infotext
+            all_prompts.append(pr)
+            all_negative_prompts.append(negp)
+            all_subseeds.append(ss)
+            infotexts.append(info)
+
+        save_image(grid, path=p.outpath_grids, basename="grid", prompt=initial_prompt, extension=opts.grid_format, info=initial_info, short_filename=not opts.grid_extended_filename, grid=True, p=p)
+
+
+        processed = Processed(p=p, images_list=images if show_images else [], seed=p.seed, info=initial_info, infotexts=infotexts, all_prompts=all_prompts, all_negative_prompts=all_negative_prompts)
 
         return processed
 
     def describe(self):
         return "Shift attention in a range of images."
+    
+def _save(path, fps, frames, infotext, width, height):
+    results = []
+
+    results += _save_mp4(path, fps, frames, infotext, width, height)
+    results += _save_webp(path, fps, frames, infotext, width, height)
+
+    return results
+
+def _save_mp4(path, fps, frames, infotext, width, height):
+    video_path = str(path) + ".mp4"
+    print(f"Generating {video_path}.")
+    try:
+        import av
+    except ImportError:
+        from launch import run_pip
+        run_pip(
+                "install imageio[pyav]",
+                "shift-attention MP4 save requirement: imageio[pyav]",
+            )
+        import av
+
+    output = av.open(video_path, "w")
+    output.metadata["Comment"] = infotext
+    stream = output.add_stream("libx264", fps, options={ "crf": "23" })
+    stream.width = width
+    stream.height = height
+
+    for v in frames:
+        frame = av.VideoFrame.from_ndarray(np.array(v))
+        packet = stream.encode(frame)
+        output.mux(packet)
+
+    packet = stream.encode(None)
+    output.mux(packet)
+    output.close()
+
+    return []
+
+def _save_webp(path, fps, frames, infotext, width, height):
+    import PIL.features, PIL.Image
+    
+    if PIL.features.check('webp_anim'):
+        import piexif
+        video_path = str(path) + ".webp"
+        print(f"Generating {video_path}.")
+
+        exif_bytes = b''
+        exif_bytes = piexif.dump({
+                    "Exif":{
+                        piexif.ExifIFD.UserComment:piexif.helper.UserComment.dump(infotext, encoding="unicode")
+                    }})
+        lossless = False
+        quality = 80
+
+        vframes = [frame.astype(np.uint8) for frame in frames]
+        vframes = [np.array(PIL.Image.fromarray(frame, mode="RGB")) for frame in vframes]
+        imageio.mimwrite(video_path, vframes, plugin='pillow',
+            duration=int(1 / fps * 1000), loop=0,
+            lossless=lossless, quality=quality, exif=exif_bytes
+        )
+        return [video_path]
+    else:
+        return []
